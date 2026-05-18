@@ -1,0 +1,21 @@
+name = "blind-hound"
+main = "src/worker.js"
+compatibility_date = "2025-12-01"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[vars]
+OLLAMA_MODEL = "deepseek-v4-flash:cloud"
+OLLAMA_BASE_URL = "https://ollama.com/api/chat"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "RoomObject"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RoomObject"]

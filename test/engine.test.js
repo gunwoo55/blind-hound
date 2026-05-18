@@ -12,6 +12,7 @@ import {
   finalJoinVillain,
   serializeGameForStorage,
   hydrateGameFromStorage,
+  sendChatMessage,
 } from '../src/engine.js';
 
 test('1인 테스트 모드는 혼자서 핵심 선역들을 조작할 수 있다', () => {
@@ -216,6 +217,28 @@ test('저장 스냅샷은 숨겨진 상태를 직접 쓰지 않고 재접속 시
   assert.ok(hydrated.knowledge.truth.characters.protagonist);
   assert.equal(hydrated.knowledge.truth.characters.protagonist.protected, true);
   assert.equal(hydrated.players[0].name, game.players[0].name);
+});
+
+test('AI/NPC 협력자는 채팅 설득 수락 전에는 명령서 협력 인물로 잠긴다', () => {
+  const game = createGame({ mode: 'hotseat', humanCount: 2, seed: 61 });
+  const before = generateActionOptions(game, 'detective', 'player_1');
+  const seoBefore = before.cooperator.find((item) => item.id === 'seo_eunchae');
+  assert.equal(seoBefore.locked, true);
+  assert.match(seoBefore.reason, /채팅/);
+
+  const afterChat = sendChatMessage(game, 'npc:seo_eunchae', 'player_1', '장부 증거를 안전하게 공개하려면 네 협력이 필요해. 우리가 보호할게, 이번 턴 도와줘.');
+  const after = generateActionOptions(afterChat, 'detective', 'player_1');
+  const seoAfter = after.cooperator.find((item) => item.id === 'seo_eunchae');
+  assert.equal(seoAfter.locked, false);
+  assert.ok(afterChat.npcCooperation.player_1.seo_eunchae.accepted);
+});
+
+test('다른 인간 플레이어 인물은 내 명령서로 직접 지시할 수 없다', () => {
+  const game = createGame({ mode: 'hotseat', humanCount: 2, seed: 62 });
+  const options = generateActionOptions(game, 'protagonist', 'player_1');
+  const detective = options.cooperator.find((item) => item.id === 'detective');
+  assert.equal(detective.locked, true);
+  assert.match(detective.reason, /다른 인간 플레이어/);
 });
 
 test('턴 진행은 명령서 판정, 악역 방해, 다음 턴 브리핑을 생성한다', () => {

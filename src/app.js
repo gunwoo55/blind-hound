@@ -16,6 +16,8 @@ import {
 import { LOCATION_STAGE_LABEL } from './data/case01.js';
 
 const STORAGE_KEY = 'blind-hound-state-v1';
+const SESSION_KEY = 'blind-hound-online-session-v1';
+const API_POLL_MS = 1800;
 const TABS = [
   ['map', '맵'],
   ['people', '인물'],
@@ -25,34 +27,27 @@ const TABS = [
   ['board', '사건보드'],
 ];
 
-let game = loadGame();
+let onlineSession = loadSession();
+let game = null;
 let activeTab = 'map';
-let activeActorId = game ? getControlledCharacters(game)[0] : 'protagonist';
+let activeActorId = 'protagonist';
 let activeThreadId = 'group';
-let currentPlayerId = game?.currentPlayerId || 'player_1';
+let currentPlayerId = onlineSession?.playerId || 'player_1';
 let selectedHumanCount = 1;
+let syncTimer = null;
+let statusText = '';
 
 const root = document.getElementById('app-root');
 
-render();
+boot();
 
-root.addEventListener('click', (event) => {
+root.addEventListener('click', async (event) => {
   const target = event.target.closest('[data-action]');
   if (!target) return;
   const action = target.dataset.action;
-  if (action === 'start') {
-    const count = Number(document.querySelector('[name="humanCount"]')?.value || selectedHumanCount || 1);
-    const mode = count === 1 ? 'solo' : 'hotseat';
-    const names = Array.from({ length: count }, (_, index) => document.querySelector(`[name="playerName${index}"]`)?.value || (index === 0 ? '건우' : `플레이어 ${index + 1}`));
-    game = createGame({ mode, humanCount: count, playerNames: names, seed: Date.now() % 1000000 });
-    currentPlayerId = game.players[0].id;
-    game.currentPlayerId = currentPlayerId;
-    activeActorId = getControlledCharacters(game, currentPlayerId)[0] || 'protagonist';
-    activeThreadId = 'group';
-    activeTab = 'map';
-    saveGame();
-    render();
-  }
+  if (action === 'create-room') await createOnlineRoom();
+  if (action === 'join-room') await joinOnlineRoom();
+  if (action === 'start-local') startLocalGame();
   if (!game) return;
   if (action === 'tab') {
     activeTab = target.dataset.tab;
@@ -68,48 +63,73 @@ root.addEventListener('click', (event) => {
     activeTab = 'command';
     render();
   }
-  if (action === 'queue-command') queueCommand();
+  if (action === 'queue-command') await queueCommand();
   if (action === 'remove-command') {
     const index = Number(target.dataset.index);
-    game.pendingCommands.splice(index, 1);
-    saveGame();
-    render();
+    if (isOnline()) await postRoom('/command/remove', { index });
+    else {
+      game.pendingCommands.splice(index, 1);
+      saveGame();
+      render();
+    }
   }
   if (action === 'resolve-turn') {
-    game = advanceTurn(game, game.pendingCommands);
-    activeActorId = getControlledCharacters(game, currentPlayerId)[0] || activeActorId;
-    saveGame();
-    render();
+    if (isOnline()) await postRoom('/turn/resolve', {});
+    else {
+      game = advanceTurn(game, game.pendingCommands);
+      activeActorId = getControlledCharacters(game, currentPlayerId)[0] || activeActorId;
+      saveGame();
+      render();
+    }
   }
-  if (action === 'send-chat') sendChat();
+  if (action === 'send-chat') await sendChat();
   if (action === 'accept-offer') {
-    game = acceptBetrayalOffer(game, target.dataset.offer, currentPlayerId);
-    saveGame();
-    render();
+    if (isOnline()) await postRoom('/offer', { offerId: target.dataset.offer, choice: 'accept' });
+    else {
+      game = acceptBetrayalOffer(game, target.dataset.offer, currentPlayerId);
+      saveGame();
+      render();
+    }
   }
   if (action === 'refuse-offer') {
-    game = refuseBetrayalOffer(game, target.dataset.offer, currentPlayerId);
-    saveGame();
-    render();
+    if (isOnline()) await postRoom('/offer', { offerId: target.dataset.offer, choice: 'refuse' });
+    else {
+      game = refuseBetrayalOffer(game, target.dataset.offer, currentPlayerId);
+      saveGame();
+      render();
+    }
   }
   if (action === 'join-villain') {
-    game = finalJoinVillain(game, currentPlayerId, 'accept');
-    saveGame();
-    render();
+    if (isOnline()) await postRoom('/join-villain', { mode: 'accept' });
+    else {
+      game = finalJoinVillain(game, currentPlayerId, 'accept');
+      saveGame();
+      render();
+    }
   }
   if (action === 'fake-join') {
-    game = finalJoinVillain(game, currentPlayerId, 'fake');
-    saveGame();
-    render();
+    if (isOnline()) await postRoom('/join-villain', { mode: 'fake' });
+    else {
+      game = finalJoinVillain(game, currentPlayerId, 'fake');
+      saveGame();
+      render();
+    }
   }
   if (action === 'delete-game') {
-    game = deleteGameData(game);
-    localStorage.removeItem(STORAGE_KEY);
+    if (isOnline()) {
+      await postRoom('/end', {});
+      clearOnlineSession();
+      game = null;
+    } else {
+      game = deleteGameData(game);
+      localStorage.removeItem(STORAGE_KEY);
+    }
     activeTab = 'map';
     render();
   }
   if (action === 'new-game') {
     localStorage.removeItem(STORAGE_KEY);
+    clearOnlineSession();
     game = null;
     activeTab = 'map';
     render();
@@ -124,11 +144,13 @@ root.addEventListener('change', (event) => {
   }
   if (!game) return;
   if (target.name === 'currentPlayer') {
-    currentPlayerId = target.value;
-    game.currentPlayerId = currentPlayerId;
-    activeActorId = getControlledCharacters(game, currentPlayerId)[0] || activeActorId;
-    saveGame();
-    render();
+    if (!isOnline()) {
+      currentPlayerId = target.value;
+      game.currentPlayerId = currentPlayerId;
+      activeActorId = getControlledCharacters(game, currentPlayerId)[0] || activeActorId;
+      saveGame();
+      render();
+    }
   }
   if (target.name === 'actorId') {
     activeActorId = target.value;
@@ -141,8 +163,11 @@ root.addEventListener('input', debounce((event) => {
   const target = event.target;
   if (!game) return;
   if (target.matches('[data-memo-for]')) {
-    game = updateProfileMemo(game, target.dataset.memoFor, target.value, currentPlayerId);
-    saveGame(false);
+    if (isOnline()) saveRemoteMemo(target.dataset.memoFor, target.value);
+    else {
+      game = updateProfileMemo(game, target.dataset.memoFor, target.value, currentPlayerId);
+      saveGame(false);
+    }
   }
 }, 250));
 
@@ -161,35 +186,37 @@ function render() {
 }
 
 function renderStartScreen() {
-  const nameInputs = Array.from({ length: selectedHumanCount }, (_, index) => `
-    <label class="field">
-      <span>플레이어 ${index + 1} 이름</span>
-      <input name="playerName${index}" value="${index === 0 ? '건우' : `플레이어 ${index + 1}`}" maxlength="16" />
-    </label>
-  `).join('');
   return `
     <main class="start-screen">
       <section class="hero-card">
         <p class="eyebrow">AI 범죄조직 전략 정치 보드게임</p>
         <h1>블라인드 하운드</h1>
-        <p class="lead">채팅으로 거짓말하고, 드롭다운 명령서로 실제 행동을 제출하며, 유리캐피탈 AI가 매수·협박·가짜 제보로 팀을 찢어놓는 모바일 웹앱입니다.</p>
+        <p class="lead">각자 다른 휴대폰에서 방코드로 입장하고, 실제 1:1/단톡 채팅으로 설득·거짓말·거래를 한 뒤, 명령서는 자기 인물의 턴 행동만 제출합니다.</p>
         <div class="mode-grid">
-          <div><strong>1인 테스트 가능</strong><span>혼자서 핵심 선역 6명을 조작</span></div>
-          <div><strong>2~6인 핫시트</strong><span>같은 기기에서 역할별 명령서 제출</span></div>
-          <div><strong>규칙 엔진 판정</strong><span>AI 연출과 판정 로직 분리</span></div>
+          <div><strong>방코드 입장</strong><span>방장 생성 후 다른 기기에서 같은 코드로 참가</span></div>
+          <div><strong>1인 테스트 가능</strong><span>1명 방은 핵심 선역을 혼자 조작</span></div>
+          <div><strong>AI/NPC 설득</strong><span>채팅에서 수락해야 명령서 협력자로 사용 가능</span></div>
         </div>
       </section>
       <section class="panel start-panel">
-        <h2>새 게임 만들기</h2>
+        <h2>방 만들기</h2>
+        <label class="field"><span>내 이름</span><input name="hostName" value="건우" maxlength="16" /></label>
         <label class="field">
-          <span>인간 플레이어 수</span>
+          <span>참가 인원</span>
           <select name="humanCount">
-            ${[1,2,3,4,5,6].map((n) => `<option value="${n}" ${n === selectedHumanCount ? 'selected' : ''}>${n}명${n === 1 ? ' · 테스트 모드' : ''}</option>`).join('')}
+            ${[1,2,3,4,5,6].map((n) => `<option value="${n}" ${n === selectedHumanCount ? 'selected' : ''}>${n}명${n === 1 ? ' · 1인 테스트' : ' · 각자 휴대폰'}</option>`).join('')}
           </select>
         </label>
-        <div class="names-grid">${nameInputs}</div>
-        <button class="primary wide" data-action="start">Case 01 《유리성의 채무》 시작</button>
-        <p class="hint">정적 GitHub Pages 빌드입니다. API 키는 저장·커밋하지 않았고, 실제 원격 멀티플레이/서버 AI는 보안 프록시 서버가 필요합니다.</p>
+        <button class="primary wide" data-action="create-room">방 만들고 시작</button>
+        <p class="hint">방을 만들면 방코드가 표시됩니다. 친구들은 같은 링크에서 방코드로 입장합니다.</p>
+      </section>
+      <section class="panel start-panel">
+        <h2>방코드로 입장</h2>
+        <label class="field"><span>방코드</span><input name="joinCode" placeholder="예: A7KQ2" maxlength="8" autocapitalize="characters" /></label>
+        <label class="field"><span>내 이름</span><input name="joinName" value="플레이어" maxlength="16" /></label>
+        <button class="wide" data-action="join-room">입장하기</button>
+        <button class="ghost wide" data-action="start-local">오프라인 로컬 테스트</button>
+        <p class="hint">${escapeHtml(statusText || '채팅과 명령서는 서버에 임시 저장되고, 게임 종료 시 삭제됩니다.')}</p>
       </section>
     </main>
   `;
@@ -197,6 +224,11 @@ function renderStartScreen() {
 
 function renderHeader() {
   const end = game.endGame ? `<span class="badge danger">${game.endGame.winner === 'hero' ? '주인공팀 승리' : game.endGame.winner === 'villain' ? '범죄조직 승리' : '종료'}</span>` : '';
+  const me = game.players.find((player) => player.id === currentPlayerId) || game.players[0];
+  const roomBadge = isOnline() ? `<span class="badge code">방코드 ${escapeHtml(onlineSession.roomCode)}</span>` : '';
+  const playerControl = isOnline()
+    ? `<span class="player-chip">${escapeHtml(me?.name || '플레이어')} · ${escapeHtml(game.characters[me?.characterId]?.roleName || '1인 테스트')}</span>`
+    : `<label class="player-switch"><span>현재</span><select name="currentPlayer">${game.players.map((player) => `<option value="${player.id}" ${player.id === currentPlayerId ? 'selected' : ''}>${escapeHtml(player.name)}</option>`).join('')}</select></label>`;
   return `
     <header class="topbar shell">
       <div>
@@ -204,13 +236,9 @@ function renderHeader() {
         <h1>블라인드 하운드</h1>
       </div>
       <div class="top-actions">
+        ${roomBadge}
         ${end}
-        <label class="player-switch">
-          <span>현재</span>
-          <select name="currentPlayer">
-            ${game.players.map((player) => `<option value="${player.id}" ${player.id === currentPlayerId ? 'selected' : ''}>${escapeHtml(player.name)}</option>`).join('')}
-          </select>
-        </label>
+        ${playerControl}
       </div>
     </header>
     <section class="briefing shell">
@@ -272,7 +300,7 @@ function renderPeople() {
   return `
     <section class="section-head">
       <h2>인물 목록과 개인 메모</h2>
-      <p>1대1 채팅 상대가 인간인지 AI인지 모드에 따라 명확하지 않을 수 있습니다. 이 테스트 빌드의 NPC 응답은 로컬 규칙 기반입니다.</p>
+      <p>AI/NPC에게 행동을 시키는 화면이 아닙니다. 먼저 1대1 채팅으로 설득·회유·거래를 하고, 수락한 NPC만 명령서 협력 인물로 사용할 수 있습니다.</p>
     </section>
     <div class="people-grid">
       ${Object.values(game.characters).map((character) => renderCharacterCard(character, controlled.has(character.id))).join('')}
@@ -330,11 +358,11 @@ function renderCommand() {
   const controlled = getControlledCharacters(game, currentPlayerId);
   if (!controlled.includes(activeActorId)) activeActorId = controlled[0] || 'protagonist';
   const actor = game.characters[activeActorId];
-  const options = generateActionOptions(game, activeActorId);
+  const options = generateActionOptions(game, activeActorId, currentPlayerId);
   return `
     <section class="section-head">
       <h2>드롭다운 명령서</h2>
-      <p>드롭다운은 규칙, 작전 메모는 세부 전략입니다. 불가능한 행동은 잠금 사유와 함께 표시됩니다.</p>
+      <p>명령서는 AI에게 시키는 지시가 아니라, 이번 턴에 <strong>내 인물</strong>이 직접 할 행동입니다. AI/NPC 행동은 채팅에서 상대가 받아들여야만 협력으로 반영됩니다.</p>
     </section>
     <section class="panel command-panel">
       <label class="field">
@@ -477,7 +505,7 @@ function renderMeter(label, value, tone) {
   return `<article class="panel meter ${tone}"><div><span>${label}</span><strong>${value}</strong></div><i style="--value:${value}%"></i></article>`;
 }
 
-function queueCommand() {
+async function queueCommand() {
   const form = document.getElementById('commandForm');
   if (!form) return;
   const data = new FormData(form);
@@ -496,18 +524,26 @@ function queueCommand() {
     secret: Boolean(data.get('secret')),
     memo: data.get('memo') || '',
   };
-  game.pendingCommands.push(command);
-  saveGame();
-  render();
+  if (isOnline()) {
+    await postRoom('/command', { command });
+  } else {
+    game.pendingCommands.push(command);
+    saveGame();
+    render();
+  }
 }
 
-function sendChat() {
+async function sendChat() {
   const input = document.querySelector('[name="chatText"]');
   const text = input?.value || '';
   if (!text.trim()) return;
-  game = sendChatMessage(game, activeThreadId, currentPlayerId, text);
-  saveGame();
-  render();
+  if (isOnline()) {
+    await postRoom('/chat', { threadId: activeThreadId, text });
+  } else {
+    game = sendChatMessage(game, activeThreadId, currentPlayerId, text);
+    saveGame();
+    render();
+  }
 }
 
 function updatePurposeHelp() {
@@ -538,6 +574,182 @@ function derivePublicLedgerStatus(intel = { stage: 'unknown' }) {
   if (intel.stage === 'confirmed' || intel.stage === 'tracking') return 'secured';
   if (intel.stage === 'estimated' || intel.stage === 'rumor') return 'located';
   return 'hidden';
+}
+
+
+async function boot() {
+  if (onlineSession?.roomCode && onlineSession?.sessionToken) {
+    try {
+      await fetchRoomState();
+      startSyncLoop();
+      return;
+    } catch (error) {
+      statusText = '이전 온라인 세션을 복구하지 못했습니다. 방코드로 다시 입장해 주세요.';
+      clearOnlineSession();
+    }
+  }
+  game = loadGame();
+  if (game) {
+    currentPlayerId = game.currentPlayerId || 'player_1';
+    activeActorId = getControlledCharacters(game, currentPlayerId)[0] || 'protagonist';
+  }
+  render();
+}
+
+function startLocalGame() {
+  clearOnlineSession();
+  const count = selectedHumanCount;
+  const hostName = document.querySelector('[name="hostName"]')?.value || '건우';
+  const names = Array.from({ length: count }, (_, index) => (index === 0 ? hostName : `플레이어 ${index + 1}`));
+  game = createGame({ mode: count === 1 ? 'solo' : 'hotseat', humanCount: count, playerNames: names, seed: Date.now() % 1000000 });
+  currentPlayerId = game.players[0].id;
+  game.currentPlayerId = currentPlayerId;
+  activeActorId = getControlledCharacters(game, currentPlayerId)[0] || 'protagonist';
+  activeThreadId = 'group';
+  activeTab = 'map';
+  saveGame();
+  render();
+}
+
+async function createOnlineRoom() {
+  const hostName = document.querySelector('[name="hostName"]')?.value || '건우';
+  statusText = '방을 만드는 중...';
+  render();
+  try {
+    const response = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hostName, maxPlayers: selectedHumanCount }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || '방 생성 실패');
+    setOnlineSession(data.session);
+    applyRoomPayload(data);
+    startSyncLoop();
+  } catch (error) {
+    statusText = `방 생성 실패: ${error.message}. 배포된 Worker 링크에서 실행 중인지 확인해 주세요.`;
+    render();
+  }
+}
+
+async function joinOnlineRoom() {
+  const code = (document.querySelector('[name="joinCode"]')?.value || '').trim().toUpperCase();
+  const playerName = document.querySelector('[name="joinName"]')?.value || '플레이어';
+  if (!code) {
+    statusText = '방코드를 입력해 주세요.';
+    render();
+    return;
+  }
+  statusText = `${code} 방에 입장하는 중...`;
+  render();
+  try {
+    const response = await fetch(`/api/rooms/${encodeURIComponent(code)}/join`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ playerName, sessionToken: onlineSession?.sessionToken }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || '입장 실패');
+    setOnlineSession(data.session);
+    applyRoomPayload(data);
+    startSyncLoop();
+  } catch (error) {
+    statusText = `입장 실패: ${error.message}`;
+    render();
+  }
+}
+
+async function fetchRoomState() {
+  const data = await requestRoom('/state', { method: 'GET' });
+  applyRoomPayload(data);
+  return data;
+}
+
+async function postRoom(path, body) {
+  const data = await requestRoom(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  if (data.deleted) {
+    clearOnlineSession();
+    game = null;
+    render();
+    return data;
+  }
+  applyRoomPayload(data);
+  return data;
+}
+
+async function requestRoom(path, init = {}) {
+  if (!onlineSession?.roomCode || !onlineSession?.sessionToken) throw new Error('온라인 세션 없음');
+  const response = await fetch(`/api/rooms/${encodeURIComponent(onlineSession.roomCode)}${path}`, {
+    ...init,
+    headers: {
+      ...(init.headers || {}),
+      authorization: `Bearer ${onlineSession.sessionToken}`,
+    },
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+
+function applyRoomPayload(data) {
+  if (!data?.game) return;
+  game = data.game;
+  currentPlayerId = data.session?.playerId || game.currentPlayerId || currentPlayerId;
+  if (data.session) setOnlineSession(data.session);
+  const controlled = getControlledCharacters(game, currentPlayerId);
+  activeActorId = controlled.includes(activeActorId) ? activeActorId : (controlled[0] || 'protagonist');
+  activeThreadId = game.threads?.[activeThreadId] ? activeThreadId : 'group';
+  statusText = data.room ? `방 ${data.room.code} · ${data.room.joinedCount}/${data.room.maxPlayers}명 접속` : '';
+  localStorage.removeItem(STORAGE_KEY);
+  render();
+}
+
+function startSyncLoop() {
+  if (syncTimer) clearInterval(syncTimer);
+  if (!isOnline()) return;
+  syncTimer = setInterval(async () => {
+    try {
+      await fetchRoomState();
+    } catch (error) {
+      statusText = `동기화 지연: ${error.message}`;
+      render();
+    }
+  }, API_POLL_MS);
+}
+
+function saveRemoteMemo(characterId, memo) {
+  postRoom('/memo', { characterId, memo }).catch((error) => {
+    statusText = `메모 저장 실패: ${error.message}`;
+  });
+}
+
+function isOnline() {
+  return Boolean(onlineSession?.roomCode && onlineSession?.sessionToken);
+}
+
+function setOnlineSession(session) {
+  onlineSession = session;
+  currentPlayerId = session.playerId || currentPlayerId;
+  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+}
+
+function loadSession() {
+  try {
+    return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function clearOnlineSession() {
+  if (syncTimer) clearInterval(syncTimer);
+  syncTimer = null;
+  onlineSession = null;
+  localStorage.removeItem(SESSION_KEY);
 }
 
 function loadGame() {

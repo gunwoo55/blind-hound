@@ -68,6 +68,7 @@ export function createGame({ mode = 'solo', humanCount = 1, playerNames = [], se
     locations,
     pendingCommands: [],
     profileMemos: {},
+    npcCooperation: {},
     threads: createInitialThreads(),
     turnLog: [],
     betrayalOffers: [],
@@ -171,7 +172,7 @@ export function generateActionOptions(game, actorId, playerId = game.currentPlay
   const location = buildLocationOptions(game, actor);
   const method = buildMethodOptions(actor);
   const resource = buildResourceOptions(game, actor, playerId);
-  const cooperator = buildCooperatorOptions(game, actor);
+  const cooperator = buildCooperatorOptions(game, actor, playerId);
   const risk = [
     option('low', '낮음: 느리지만 안전하게 진행'),
     option('medium', '중간: 흔적을 일부 남기지만 균형 잡힘'),
@@ -439,16 +440,31 @@ export function canFinalJoinVillain(game, playerId = game.currentPlayerId) {
   return { allowed: reasons.length === 0, reasons };
 }
 
-export function sendChatMessage(game, threadId, senderId, text) {
+export function sendChatMessage(game, threadId, senderId, text, options = {}) {
   const next = clone(game);
   if (!text?.trim()) return next;
+  const cleanText = text.trim();
   const senderName = getName(next, senderId) || '플레이어';
-  appendMessage(next, threadId, senderId, senderName, text.trim());
   const thread = next.threads[threadId];
-  if (thread?.kind === 'npc') {
+  const isNpcDm = thread?.kind === 'npc';
+  if (isNpcDm) {
     const npcId = thread.characterId;
-    const reply = makeNpcReply(next, npcId, text.trim());
-    appendMessage(next, threadId, npcId, getName(next, npcId), reply);
+    const controller = getCharacterController(next, npcId);
+    if (controller && controller.id !== senderId) {
+      appendMessage(next, threadId, senderId, senderName, cleanText, { participants: [senderId, controller.id] });
+      return next;
+    }
+  }
+  appendMessage(next, threadId, senderId, senderName, cleanText, isNpcDm ? { viewerId: senderId } : {});
+  if (isNpcDm) {
+    const npcId = thread.characterId;
+    const interaction = handleNpcChatEffects(next, npcId, cleanText, senderId);
+    const reply = options.npcReplyText || interaction.reply || makeNpcReply(next, npcId, cleanText);
+    appendMessage(next, threadId, npcId, getName(next, npcId), reply, {
+      viewerId: senderId,
+      npcAccepted: Boolean(interaction.accepted),
+      npcRefused: Boolean(interaction.refused),
+    });
   }
   return next;
 }
@@ -650,12 +666,42 @@ function buildResourceOptions(game, actor, playerId = game.currentPlayerId) {
   return resources;
 }
 
-function buildCooperatorOptions(game, actor) {
+function buildCooperatorOptions(game, actor, playerId = game.currentPlayerId) {
   const cooperators = [option('none', '단독 행동')];
+  const controlled = new Set(getControlledCharacters(game, playerId));
   for (const character of Object.values(game.characters)) {
-    if (character.id !== actor.id && ['hero', 'neutral'].includes(character.faction)) {
-      cooperators.push(option(character.id, `${character.name} / ${character.roleName}`));
+    if (character.id === actor.id) continue;
+    if (controlled.has(character.id)) {
+      cooperators.push(option(character.id, `${character.name} / ${character.roleName} · 내가 조작`));
+      continue;
     }
+    const controller = getCharacterController(game, character.id);
+    if (controller && controller.id !== playerId) {
+      cooperators.push(option(
+        character.id,
+        `${character.name} / ${character.roleName}`,
+        true,
+        '다른 인간 플레이어가 조작하는 인물입니다. 채팅으로 협의한 뒤 그 플레이어가 직접 명령서에 반영해야 합니다.',
+      ));
+      continue;
+    }
+    if (['hero', 'neutral'].includes(character.faction)) {
+      const accepted = hasNpcCooperation(game, playerId, character.id);
+      cooperators.push(option(
+        character.id,
+        `${character.name} / ${character.roleName}${accepted ? ' · 채팅 협력 수락' : ''}`,
+        !accepted,
+        accepted ? '' : 'AI/NPC 인물은 명령서로 직접 지시할 수 없습니다. 먼저 1:1 채팅에서 설득·회유·거래로 협력 수락을 받아야 합니다.',
+      ));
+      continue;
+    }
+    const acceptedVillainDeal = hasNpcCooperation(game, playerId, character.id);
+    cooperators.push(option(
+      character.id,
+      `${character.name} / ${character.roleName}${acceptedVillainDeal ? ' · 위험한 거래' : ''}`,
+      !acceptedVillainDeal,
+      acceptedVillainDeal ? '' : '적대 인물은 명령서 협력자가 아닙니다. 채팅에서 거래가 성립해야만 제한적으로 움직입니다.',
+    ));
   }
   return cooperators;
 }
@@ -1065,6 +1111,73 @@ function makeBetrayalOffer(game, playerId) {
   };
 }
 
+function getCharacterController(game, characterId) {
+  return game.players.find((player) => getControlledCharacters(game, player.id).includes(characterId)) || null;
+}
+
+function hasNpcCooperation(game, playerId, characterId) {
+  return Boolean(game.npcCooperation?.[playerId]?.[characterId]?.accepted);
+}
+
+function grantNpcCooperation(game, playerId, characterId, note) {
+  game.npcCooperation ||= {};
+  game.npcCooperation[playerId] ||= {};
+  game.npcCooperation[playerId][characterId] = { accepted: true, turn: game.turn, note: note.slice(0, 160) };
+}
+
+function handleNpcChatEffects(game, npcId, text, playerId) {
+  const npc = game.characters[npcId];
+  if (!npc) return { accepted: false, refused: true, reply: '기록되지 않은 상대입니다.' };
+  const player = game.players.find((item) => item.id === playerId);
+  const asksAction = /(도와|협력|같이|해줘|해주세요|부탁|설득|회유|거래|협상|장부|위치|보호|숨겨|동행|움직|넘겨|알려)/.test(text);
+  if (!asksAction) return { accepted: false, refused: false, reply: '' };
+
+  const hasLeverage = /(증거|장부|보호|안전|돈|대가|보상|살려|공개|비밀|위험|도윤|서은채|백무진)/.test(text) || text.length >= 22;
+
+  if (npc.faction === 'villain') {
+    if (/(거래|돈|배신|합류|붙|정보|위치|넘겨)/.test(text) && player) {
+      const alreadyOpen = game.betrayalOffers.some((offer) => offer.playerId === playerId && offer.status === 'open');
+      if (!alreadyOpen && ['broker', 'boss'].includes(npcId)) {
+        game.betrayalOffers.push(makeBetrayalOffer(game, playerId));
+        game.stats.betrayalTemperature = clamp(game.stats.betrayalTemperature + 10, 0, 100);
+      }
+      grantNpcCooperation(game, playerId, npcId, '범죄조직과 위험한 거래 채널이 열림');
+      return {
+        accepted: true,
+        refused: false,
+        reply: `${npc.name}: “좋아. 말로만 끝내지 말고 대가를 보여. 비밀 화면에 조건을 남겨두지.”`,
+      };
+    }
+    return {
+      accepted: false,
+      refused: true,
+      reply: `${npc.name}: “명령하듯 말하지 마. 네가 줄 수 있는 패를 먼저 증명해.”`,
+    };
+  }
+
+  if (hasLeverage || npc.faction === 'hero') {
+    grantNpcCooperation(game, playerId, npcId, text);
+    game.stats.teamTrust = clamp(game.stats.teamTrust + 2, 0, 100);
+    if (npcId === 'seo_eunchae' && /장부/.test(text)) {
+      game.knowledge.public.ledgerIntel.victim_list = { stage: 'estimated', locationIds: ['B3', 'B4'] };
+    }
+    if (npcId === 'gang_mira' && /(보복|복수|기다)/.test(text)) {
+      game.stats.hostageRisk = clamp(game.stats.hostageRisk - 3, 0, 100);
+    }
+    return {
+      accepted: true,
+      refused: false,
+      reply: `${npc.name}: “좋아요. 이번 턴에는 협력하겠습니다. 이제 명령서의 협력 인물에서 저를 선택할 수 있어요.”`,
+    };
+  }
+
+  return {
+    accepted: false,
+    refused: true,
+    reply: `${npc.name}: “아직은 못 믿겠어요. 왜 내가 움직여야 하는지 더 설득해 주세요.”`,
+  };
+}
+
 function makeNpcReply(game, npcId, text) {
   const lowered = text.toLowerCase();
   const npc = game.characters[npcId];
@@ -1100,7 +1213,7 @@ function appendSystemMessage(game, threadId, title, text) {
   appendMessage(game, threadId, 'system', title, text);
 }
 
-function appendMessage(game, threadId, senderId, senderName, text) {
+function appendMessage(game, threadId, senderId, senderName, text, meta = {}) {
   game.threads[threadId] ||= { id: threadId, name: threadId, kind: 'custom', messages: [] };
   game.threads[threadId].messages.push({
     id: `${threadId}-${Date.now()}-${Math.floor((game.rngState || 1) % 100000)}-${game.threads[threadId].messages.length}`,
@@ -1109,6 +1222,7 @@ function appendMessage(game, threadId, senderId, senderName, text) {
     senderName,
     text,
     at: new Date().toISOString(),
+    ...meta,
   });
 }
 

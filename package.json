@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node --test",
     "build": "node scripts/build.js",
-    "check": "npm test && npm run build"
+    "check": "npm test && npm run build",
+    "deploy": "npm run check && npx wrangler deploy"
   },
   "keywords": [
     "mobile-game",
