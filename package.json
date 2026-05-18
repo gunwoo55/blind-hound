@@ -1,0 +1,18 @@
+{
+  "name": "blind-hound",
+  "version": "0.1.0",
+  "description": "모바일 웹 전략 정치 보드게임 《블라인드 하운드》 MVP",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "build": "node scripts/build.js",
+    "check": "npm test && npm run build"
+  },
+  "keywords": [
+    "mobile-game",
+    "board-game",
+    "political-strategy",
+    "korean"
+  ],
+  "license": "MIT"
+}
